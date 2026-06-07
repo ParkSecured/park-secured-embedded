@@ -1,0 +1,359 @@
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <BluetoothSerial.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <time.h>
+#include "soc/rtc_cntl_reg.h"
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONFIGURARE — modifica doar aici
+// ═══════════════════════════════════════════════════════════════════
+#define WIFI_SSID    "numele_hotspotului"
+#define WIFI_PASS    "parola_hotspot"
+#define CLOUD_API_BASE_URL "https://park-secured-cloud-r62j.onrender.com/api"
+#define GATE_API_KEY "CHANGE_ME_GATE_API_KEY"
+
+// ─── Pini LED ───────────────────────────────────────────────────
+#define PIN_LED_VERDE     25
+#define PIN_LED_ROSU      26
+#define PIN_LED_GALBEN    27
+#define PIN_LED_ALBASTRU  14
+
+// ─── Pini bariere IR ────────────────────────────────────────────
+// B1 = latura EXTERIOARA (masina vine din strada)
+// B2 = latura INTERIOARA (masina vine din curte)
+// TX: IR LED la 38kHz (via ledc)
+// RX: TSOP — LOW = primeste semnal (cale libera), HIGH = blocat
+#define PIN_IR_TX1    32
+#define PIN_IR_RX1    34
+#define PIN_IR_TX2    33
+#define PIN_IR_RX2    35
+
+// ─── Servo ──────────────────────────────────────────────────────
+#define PIN_SERVO      13
+#define SERVO_INCHIS    0
+#define SERVO_DESCHIS  90
+#define TIMP_SERVO_MS  1000   // timp pana poarta ajunge la capat
+
+// ─── Timeouturi ─────────────────────────────────────────────────
+#define TIMEOUT_BT_MS         15000
+#define TIMEOUT_TRECERE_MS    15000
+
+// ═══════════════════════════════════════════════════════════════════
+//  OBIECTE GLOBALE
+// ═══════════════════════════════════════════════════════════════════
+Servo           servoPoarta;
+BluetoothSerial SerialBT;
+
+// ═══════════════════════════════════════════════════════════════════
+//  LED-URI
+// ═══════════════════════════════════════════════════════════════════
+void leduriOpresteTot() {
+    digitalWrite(PIN_LED_VERDE,    LOW);
+    digitalWrite(PIN_LED_ROSU,     LOW);
+    digitalWrite(PIN_LED_GALBEN,   LOW);
+    digitalWrite(PIN_LED_ALBASTRU, LOW);
+}
+void ledSistemPornit() { leduriOpresteTot(); digitalWrite(PIN_LED_GALBEN,   HIGH); }
+void ledAccesPermis()  { leduriOpresteTot(); digitalWrite(PIN_LED_VERDE,    HIGH); }
+void ledAccesRefuzat() { leduriOpresteTot(); digitalWrite(PIN_LED_ROSU,     HIGH); }
+void ledMotorActiv()   {                     digitalWrite(PIN_LED_ALBASTRU, HIGH); }
+void ledMotorOprit()   {                     digitalWrite(PIN_LED_ALBASTRU, LOW);  }
+
+// ═══════════════════════════════════════════════════════════════════
+//  BARIERE IR
+//  TX: 38kHz continuu via ledc (canale 4 si 5, compatibil cu ESP32PWM)
+//  RX: digitalRead — HIGH = blocat, LOW = cale libera
+// ═══════════════════════════════════════════════════════════════════
+void bariereSetup() {
+    ledcSetup(4, 38000, 8); ledcAttachPin(PIN_IR_TX1, 4); ledcWrite(4, 127);
+    ledcSetup(5, 38000, 8); ledcAttachPin(PIN_IR_TX2, 5); ledcWrite(5, 127);
+    pinMode(PIN_IR_RX1, INPUT);
+    pinMode(PIN_IR_RX2, INPUT);
+}
+
+bool b1Blocata() { return digitalRead(PIN_IR_RX1) == HIGH; }
+bool b2Blocata() { return digitalRead(PIN_IR_RX2) == HIGH; }
+
+// ═══════════════════════════════════════════════════════════════════
+//  TIMP (NTP)
+// ═══════════════════════════════════════════════════════════════════
+void ntpSetup() {
+    configTime(3600, 3600, "pool.ntp.org", "time.nist.gov");
+    Serial.print("[NTP] Sincronizare");
+    struct tm t;
+    int tries = 0;
+    while (!getLocalTime(&t) && tries++ < 20) { delay(500); Serial.print("."); }
+    Serial.println(getLocalTime(&t) ? " OK" : " ESUAT");
+}
+
+String getTimestamp() {
+    struct tm t;
+    if (!getLocalTime(&t)) return "necunoscut";
+    char buf[25];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &t);
+    return String(buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  WIFI
+// ═══════════════════════════════════════════════════════════════════
+void wifiSetup() {
+    Serial.print("[WiFi] Conectare la " + String(WIFI_SSID));
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries++ < 20) {
+        delay(500); Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\n[WiFi] Conectat! IP: " + WiFi.localIP().toString());
+        ledSistemPornit();
+    } else {
+        Serial.println("\n[WiFi] EROARE conectare!");
+    }
+}
+
+String eventTypeFromSens(String sens) {
+    return sens == "iesire" ? "EXIT" : "ENTRY";
+}
+
+// POST /api/gate/validate-bluetooth
+// Request:  { "bluetoothCode": "CODE:ENTRY|EXIT" }
+// Response: { "authorized": true | false, "status": "ALLOWED|DENIED|PENDING" }
+bool wifiValideazaCod(String cod, String sens) {
+    if (WiFi.status() != WL_CONNECTED) { wifiSetup(); return false; }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, String(CLOUD_API_BASE_URL) + "/gate/validate-bluetooth");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Gate-Api-Key", GATE_API_KEY);
+
+    String bluetoothCode = cod + ":" + eventTypeFromSens(sens);
+    String body = "{\"bluetoothCode\":\"" + bluetoothCode + "\"}";
+    int code = http.POST(body);
+
+    bool valid = false;
+    if (code == 200) {
+        String r = http.getString();
+        Serial.println("[WiFi] Raspuns validare: " + r);
+        valid = (r.indexOf("\"authorized\":true") >= 0 || r.indexOf("\"authorized\": true") >= 0);
+    } else {
+        Serial.println("[WiFi] Eroare HTTP validare: " + String(code));
+    }
+    http.end();
+    return valid;
+}
+
+// POST /api/hardware/update-status
+// Request:  { "hardwareState": "...", "hardwareLed": "..." }
+// Response: { "success": true }
+void wifiTrimiteEveniment(String cod, String sens, bool valid) {
+    if (WiFi.status() != WL_CONNECTED) { wifiSetup(); }
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[WiFi] Nu pot trimite eveniment - offline!");
+        return;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    HTTPClient http;
+    http.begin(client, String(CLOUD_API_BASE_URL) + "/hardware/update-status");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Gate-Api-Key", GATE_API_KEY);
+
+    String body = String("{\"hardwareState\":\"Inchisa\",")
+                + "\"hardwareLed\":\"" + String(valid ? "Verde" : "Rosu") + "\","
+                + "\"lastEventAt\":\"" + getTimestamp() + "\"}";
+
+    Serial.println("[WiFi] Eveniment: " + body);
+    int code = http.POST(body);
+    Serial.println("[WiFi] Eveniment status: " + String(code));
+    http.end();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SERVO / POARTA
+// ═══════════════════════════════════════════════════════════════════
+void deschidePoarta() {
+    Serial.println("[SERVO] Deschid poarta...");
+    ledMotorActiv();
+    servoPoarta.write(SERVO_DESCHIS);
+    delay(TIMP_SERVO_MS);
+    ledMotorOprit();
+    Serial.println("[SERVO] Poarta deschisa.");
+}
+
+void inchidePoarta() {
+    Serial.println("[SERVO] Inchid poarta...");
+    ledMotorActiv();
+    servoPoarta.write(SERVO_INCHIS);
+    delay(TIMP_SERVO_MS);
+    ledMotorOprit();
+    Serial.println("[SERVO] Poarta inchisa.");
+}
+
+// Asteapta ca masina sa treaca complet prin poarta
+void asteaptaTrecereMasina() {
+    Serial.println("[POARTA] Astept trecerea masinii...");
+
+    // Faza 1: asteapta ca cel putin o barierea sa se blocheze (masina intra in zona)
+    unsigned long start = millis();
+    while (!b1Blocata() && !b2Blocata()) {
+        if (millis() - start > TIMEOUT_TRECERE_MS) {
+            Serial.println("[POARTA] Timeout - masina nu a intrat in zona!");
+            return;
+        }
+        delay(50);
+    }
+
+    // Faza 2: asteapta ca AMBELE bariere sa fie libere (masina a trecut complet)
+    start = millis();
+    while (b1Blocata() || b2Blocata()) {
+        if (millis() - start > TIMEOUT_TRECERE_MS) {
+            Serial.println("[POARTA] Timeout - masina blocata in zona portatii!");
+            return;
+        }
+        delay(50);
+    }
+
+    delay(300);
+    Serial.println("[POARTA] Masina a trecut complet.");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PAS 1 — DETECTEAZA MASINA SI SENSUL
+//  B1 activata prima → INTRARE
+//  B2 activata prima → IESIRE
+// ═══════════════════════════════════════════════════════════════════
+String detecteazaMasinasiSens() {
+    Serial.println("\n[PAS 1] Astept masina... (LED galben fix)");
+    ledSistemPornit();
+
+    while (true) {
+        if (b1Blocata()) {
+            Serial.println("[PAS 1] B1 activata → INTRARE");
+            return "intrare";
+        }
+        if (b2Blocata()) {
+            Serial.println("[PAS 1] B2 activata → IESIRE");
+            return "iesire";
+        }
+        delay(50);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PAS 2 — ASTEAPTA COD BLUETOOTH (15s, LED galben clipeste)
+// ═══════════════════════════════════════════════════════════════════
+String asteaptaCodBluetooth() {
+    Serial.println("[PAS 2] Astept cod Bluetooth... (15s timeout)");
+
+    unsigned long start    = millis();
+    bool          ledState = false;
+
+    while (millis() - start < TIMEOUT_BT_MS) {
+        // Clipire non-blocanta
+        bool nouLed = ((millis() - start) % 500) < 250;
+        if (nouLed != ledState) {
+            ledState = nouLed;
+            digitalWrite(PIN_LED_GALBEN, ledState ? HIGH : LOW);
+        }
+
+        if (SerialBT.available()) {
+            String cod = SerialBT.readStringUntil('\n');
+            cod.trim();
+            Serial.println("[PAS 2] Cod primit: " + cod);
+            return cod;
+        }
+        delay(10);
+    }
+
+    Serial.println("[PAS 2] Timeout - niciun cod primit!");
+    return "";
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PAS 3 — VALIDEAZA COD PRIN WIFI
+// ═══════════════════════════════════════════════════════════════════
+bool valideazaCod(String cod, String sens) {
+    if (cod == "") {
+        Serial.println("[PAS 3] Cod gol - refuzat automat.");
+        SerialBT.println("REFUZAT");
+        return false;
+    }
+
+    Serial.println("[PAS 3] Validez codul prin WiFi...");
+    bool valid = wifiValideazaCod(cod, sens);
+
+    SerialBT.println(valid ? "PERMIS" : "REFUZAT");
+    Serial.println("[PAS 3] Rezultat: " + String(valid ? "PERMIS" : "REFUZAT"));
+    return valid;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════
+void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+    Serial.begin(115200);
+    delay(1000);
+
+    pinMode(PIN_LED_VERDE,    OUTPUT);
+    pinMode(PIN_LED_ROSU,     OUTPUT);
+    pinMode(PIN_LED_GALBEN,   OUTPUT);
+    pinMode(PIN_LED_ALBASTRU, OUTPUT);
+    leduriOpresteTot();
+
+    bariereSetup();
+
+    ESP32PWM::allocateTimer(0);
+    servoPoarta.setPeriodHertz(50);
+    servoPoarta.attach(PIN_SERVO, 500, 2400);
+    servoPoarta.write(SERVO_INCHIS);
+
+    SerialBT.begin("ESP32_Poarta");
+    Serial.println("[BT] Pornit: ESP32_Poarta");
+
+    wifiSetup();
+    ntpSetup();
+
+    Serial.println("\n=== SISTEM GESTIUNE ACCES PORNIT ===\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LOOP
+// ═══════════════════════════════════════════════════════════════════
+void loop() {
+    // PAS 1: Detecteaza masina + sens (intrare / iesire)
+    String sens = detecteazaMasinasiSens();
+
+    // PAS 2: Asteapta codul de la telefonul angajatului
+    String cod = asteaptaCodBluetooth();
+
+    // PAS 3: Valideaza prin WiFi + raspunde la telefon
+    bool valid = valideazaCod(cod, sens);
+
+    // PAS 4: Actioneaza poarta
+    if (valid) {
+        ledAccesPermis();
+        deschidePoarta();
+        asteaptaTrecereMasina();
+        inchidePoarta();
+    } else {
+        ledAccesRefuzat();
+        delay(3000);
+    }
+
+    // PAS 5: Raporteaza evenimentul la server (indiferent de rezultat)
+    wifiTrimiteEveniment(cod, sens, valid);
+
+    ledSistemPornit();
+    Serial.println("\n--- Ciclu complet. Reiau... ---\n");
+    delay(1000);
+}
