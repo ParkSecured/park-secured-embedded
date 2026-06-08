@@ -248,16 +248,33 @@ void servoRidica() {
     Serial.println("[SERVO] Brat ridicat (limitator superior activ).");
 }
 
-void servoCoboaraNormal() {
+// Returneaza true daca bratul a fost coborat complet,
+// false daca a detectat un vehicul la bariera de start si a reridicat bratul.
+bool servoCoboaraNormal() {
     Serial.println("[SERVO] Cobor bratul...");
     int pozCurenta = SERVO_DESCHIS;
     while (pozCurenta > SERVO_INCHIS) {
+        // Verifica bariera de start in timpul coborarii
+        if (barieraStartBlocata()) {
+            Serial.println("[SERVO] Obstacol detectat in timpul inchiderii! Ridic bara...");
+            // Ridica bara inapoi la pozitia deschisa
+            while (pozCurenta < SERVO_DESCHIS) {
+                pozCurenta++;
+                servoPoarta.write(pozCurenta);
+                ledS1Intermitent();
+                delay(SERVO_PAS_DELAY_MS);
+            }
+            Serial.println("[SERVO] Bara reridica (revenire la S2).");
+            return false;
+        }
         pozCurenta--;
         servoPoarta.write(pozCurenta);
-        ledS4();
+        leduriOpresteTot();
+        digitalWrite(PIN_LED_ALBASTRU, HIGH); // LED albastru in timpul inchiderii
         delay(SERVO_PAS_DELAY_MS);
     }
     Serial.println("[SERVO] Brat coborat (limitator inferior activ).");
+    return true;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -446,6 +463,16 @@ void loop() {
         case S3_SIGURANTA_IR: {
             ledS3();
 
+            // Re-trigger: daca bariera de START detecteaza o noua masina
+            // (in timp ce bariera finala e inca blocata sau imediat dupa),
+            // bara ramane deschisa si revenim in S2 sa asteptam trecerea ei.
+            if (barieraStartBlocata()) {
+                Serial.println("[FSM] S3 → S2 (noua masina detectata la bariera de start)");
+                wifiTrimiteStatus("Deschisa", "Verde");
+                starePoarta = S2_DESCHISA;
+                break;
+            }
+
             // Asteapta ca bariera FINALA sa se elibereze
             // intrare: B2 (masina a trecut de bara servo)
             // iesire:  B1 (masina a trecut de bara servo in sens invers)
@@ -456,8 +483,16 @@ void loop() {
             unsigned long freeStart = millis();
             while (millis() - freeStart < TIMEOUT_IR_LIBER_MS) {
                 ledS3();
+                // Re-trigger si in timpul timerului de 5s
+                if (barieraStartBlocata()) {
+                    Serial.println("[FSM] S3 → S2 (noua masina detectata in fereastra 5s)");
+                    wifiTrimiteStatus("Deschisa", "Verde");
+                    starePoarta = S2_DESCHISA;
+                    break;
+                }
                 delay(10);
             }
+            if (starePoarta == S2_DESCHISA) break;
 
             Serial.println("[FSM] S3 → S4 (bariera finala libera + 5s)");
             wifiTrimiteStatus("In curs de inchidere", "Rosu");
@@ -468,12 +503,16 @@ void loop() {
         // ── S4: IN CURS DE INCHIDERE — motor coboara bratul ─────
         case S4_IN_CURS_INCHIDERE: {
             Serial.println("[FSM] S4 — cobor bratul");
-            servoCoboaraNormal();
+            bool inchisComplet = servoCoboaraNormal();
 
-            // T5: daca bariera de START detecteaza obstacol in timpul inchiderii → S1 (urgenta)
-            // (bariera de start e cea dinspre care vine masina, deci singura relevanta pentru siguranta)
-            // Nota: servoCoboaraNormal e blocant, deci T5 e verificat dupa coborare
-            // Pentru siguranta reala ar trebui coborat pas cu pas — lasam pentru v2
+            if (!inchisComplet) {
+                // Bariera de start detectata in timpul coborarii — bara a fost reridica automat
+                Serial.println("[FSM] S4 → S2 (vehicul detectat in timpul inchiderii)");
+                wifiTrimiteStatus("Deschisa", "Verde");
+                starePoarta = S2_DESCHISA;
+                break;
+            }
+
             Serial.println("[FSM] S4 → S0 (limitator inferior)");
             wifiTrimiteStatus("Inchisa", "Rosu");
             starePoarta = S0_INCHISA;
