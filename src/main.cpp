@@ -38,7 +38,7 @@
 #define SERVO_PAS_DELAY_MS 20 // delay intre pasi (ms) — mai mare = mai lent
 
 // ─── Timeouturi ─────────────────────────────────────────────────
-#define TIMEOUT_BLE_MS      60000
+#define TIMEOUT_BLE_MS      120000
 #define TIMEOUT_IR_LIBER_MS  5000  // T4: dupa eliberarea barierei finale, 5s inainte de inchidere
 
 // ─── BLE UUIDs ──────────────────────────────────────────────────
@@ -328,7 +328,7 @@ void bleSetup() {
 //  ASTEAPTA COD BLE
 // ═══════════════════════════════════════════════════════════════════
 String asteaptaCodBLE() {
-    Serial.println("[BLE] Astept cod... 1m timeout)");
+    Serial.println("[BLE] Astept cod... (2m timeout)");
     bleCodPrimit   = false;
     bleCodReceptat = "";
 
@@ -437,11 +437,38 @@ void loop() {
         // ── S1: IN CURS DE DESCHIDERE — motor ridica bratul ─────
         case S1_IN_CURS_DESCHIDERE: {
             Serial.println("[FSM] S1 — ridic bratul");
-            servoRidica();
+            int pozCurenta = SERVO_INCHIS;
+            bool masinaATrecut = false;
 
-            Serial.println("[FSM] S1 → S2 (limitator superior)");
+            while (pozCurenta < SERVO_DESCHIS) {
+                pozCurenta++;
+                servoPoarta.write(pozCurenta);
+                ledS1Intermitent();
+                delay(SERVO_PAS_DELAY_MS);
+
+                if (barieraFinalBlocata()) {
+                    masinaATrecut = true;
+                    break;
+                }
+            }
+
+            // Termina de ridicat chiar daca masina a trecut deja
+            while (pozCurenta < SERVO_DESCHIS) {
+                pozCurenta++;
+                servoPoarta.write(pozCurenta);
+                delay(SERVO_PAS_DELAY_MS);
+            }
+
             wifiTrimiteStatus("Deschisa", "Verde");
-            starePoarta = S2_DESCHISA;
+
+            if (masinaATrecut) {
+                Serial.println("[FSM] S1 → S3 (vehicul a trecut in timpul deschiderii)");
+                wifiTrimiteStatus("Siguranta IR", "Albastru");
+                starePoarta = S3_SIGURANTA_IR;
+            } else {
+                Serial.println("[FSM] S1 → S2 (limitator superior)");
+                starePoarta = S2_DESCHISA;
+            }
             break;
         }
 
